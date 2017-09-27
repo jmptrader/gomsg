@@ -1,15 +1,17 @@
 package gomsg
 
 import (
-	"errors"
 	"net"
+	"sync"
 	"time"
+
+	"github.com/quintans/toolkit/faults"
 )
 
-func ExternalIP() (string, error) {
+func IP() (string, error) {
 	ifaces, err := net.Interfaces()
 	if err != nil {
-		return "", err
+		return "", faults.Wrap(err)
 	}
 	for _, iface := range ifaces {
 		if iface.Flags&net.FlagUp == 0 {
@@ -20,7 +22,7 @@ func ExternalIP() (string, error) {
 		}
 		addrs, err := iface.Addrs()
 		if err != nil {
-			return "", err
+			return "", faults.Wrap(err)
 		}
 		for _, addr := range addrs {
 			var ip net.IP
@@ -40,32 +42,7 @@ func ExternalIP() (string, error) {
 			return ip.String(), nil
 		}
 	}
-	return "", errors.New("are you connected to the network?")
-}
-
-type PollItem struct {
-	Index int
-	Error interface{}
-}
-
-// from an array of channels returning the first to complete
-func Poll(chans []chan interface{}, timeout time.Duration) PollItem {
-	out := make(chan PollItem, len(chans)+1)
-	go func() {
-		time.Sleep(timeout)
-		out <- PollItem{-1, nil}
-	}()
-	for k, v := range chans {
-		go func(i int, errch chan interface{}) {
-			select {
-			case <-time.After(timeout):
-			case e := <-errch:
-				out <- PollItem{i, e}
-			}
-		}(k, v)
-	}
-	// only the first matters
-	return <-out
+	return "", faults.New("Are you connected to the network?")
 }
 
 type Looper struct {
@@ -107,4 +84,106 @@ func (this *Looper) Last() int {
 
 func (this *Looper) HasNext() bool {
 	return this.cursor < this.max
+}
+
+// Timeout is a timer over a generic element, that will call a function when a specified timeout occurs.
+// It is possible to delay the timeout.
+type Timeout struct {
+	mu       sync.RWMutex
+	what     map[interface{}]time.Time
+	ticker   *time.Ticker
+	duration time.Duration
+	handle   uint32
+}
+
+// NewTimeout create a timeout
+func NewTimeout(tick time.Duration, duration time.Duration, expired func(o interface{})) *Timeout {
+	this := new(Timeout)
+	this.what = make(map[interface{}]time.Time)
+	this.duration = duration
+	this.ticker = time.NewTicker(tick)
+	go func() {
+		for _ = range this.ticker.C {
+			this.purge(expired)
+		}
+	}()
+	return this
+}
+
+func (timeout *Timeout) purge(expired func(o interface{})) {
+	timeout.mu.Lock()
+	defer timeout.mu.Unlock()
+
+	now := time.Now()
+	for k, v := range timeout.what {
+		if v.Before(now) {
+			expired(k)
+			delete(timeout.what, k)
+		}
+	}
+}
+
+// Delay delays the timeout occurence.
+// If this is the first time it is called, only from now the timeout will occur.
+func (timeout *Timeout) Delay(o interface{}) {
+	timeout.mu.Lock()
+	defer timeout.mu.Unlock()
+
+	timeout.what[o] = time.Now().Add(timeout.duration)
+}
+
+type KeyValueItem struct {
+	Key   interface{}
+	Value interface{}
+}
+
+type KeyValue struct {
+	Items []*KeyValueItem
+}
+
+func NewKeyValue() *KeyValue {
+	return &KeyValue{make([]*KeyValueItem, 0)}
+}
+
+func (kv *KeyValue) Put(key interface{}, value interface{}) interface{} {
+
+	// if already defined, replace value and return old one
+	for _, v := range kv.Items {
+		if v.Key == key {
+			var old = v.Value
+			v.Value = value
+			return old
+		}
+	}
+	var item = &KeyValueItem{key, value}
+	kv.Items = append(kv.Items, item)
+	return nil
+}
+
+func (kv *KeyValue) Get(key interface{}) interface{} {
+	return kv.Find(func(item *KeyValueItem) bool {
+		return item.Key == key
+	})
+}
+
+func (kv *KeyValue) Find(fn func(item *KeyValueItem) bool) *KeyValueItem {
+	for _, v := range kv.Items {
+		if fn(v) {
+			return v
+		}
+	}
+	return nil
+}
+
+func (kv *KeyValue) Delete(key interface{}) interface{} {
+	for k, v := range kv.Items {
+		if v.Key == key {
+			// since the slice has a non-primitive, we have to zero it
+			copy(kv.Items[k:], kv.Items[k+1:])
+			kv.Items[len(kv.Items)-1] = nil // zero it
+			kv.Items = kv.Items[:len(kv.Items)-1]
+			return v.Value
+		}
+	}
+	return nil
 }

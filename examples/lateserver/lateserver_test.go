@@ -2,18 +2,22 @@ package main
 
 import (
 	"fmt"
+	"testing"
 	"time"
 
 	"github.com/quintans/gomsg"
 )
 
-func main() {
-	cli := gomsg.NewClient().Connect("localhost:7777")
+func TestLateServer(t *testing.T) {
+	cli := gomsg.NewClient()
+	cli.Connect("localhost:7777")
 	time.Sleep(time.Millisecond * 100)
 
+	var result string
 	// THE SERVER SHOWS UP AFTER THE CLIENT
 	server := gomsg.NewServer()
 	server.Handle("XPTO", func(m string) {
+		result = m
 		fmt.Println("<=== handling pull:", m)
 	})
 	server.Listen(":7777")
@@ -33,4 +37,9 @@ func main() {
 		<-server.Publish("SUB", "teste")
 	*/
 	time.Sleep(time.Second)
+
+	if result != "teste" {
+		t.Fatal("Expected 'teste', got", result)
+	}
+
 }

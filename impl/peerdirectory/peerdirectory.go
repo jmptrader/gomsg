@@ -1,9 +1,11 @@
-package impl
+package peerdirectory
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"sync"
+	"time"
 
 	"github.com/quintans/gomsg"
 )
@@ -14,12 +16,13 @@ type Directory struct {
 	server *gomsg.Server
 }
 
-// creates a directory service where all the clients connect to know about their peers
+// NewDirectory creates a peer directory where all the clients connect to know about their peers
 func NewDirectory(addr string, codec gomsg.Codec) *Directory {
 	dir := &Directory{
 		peers: make(map[net.Conn]string),
 	}
-	dir.server = gomsg.NewServer().SetCodec(codec)
+	dir.server = gomsg.NewServer()
+	dir.server.SetCodec(codec)
 	dir.server.OnClose = func(c net.Conn) {
 		// this will be called if a peer stops pinging
 		fmt.Println("< Dir: peer", c.RemoteAddr(), "exited")
@@ -108,7 +111,10 @@ func (this *Peers) Remove(addr string) {
 	for k, v := range this.peers {
 		if v.addr == addr {
 			v.peer.Destroy()
-			this.peers = append(this.peers[:k], this.peers[k+1:]...)
+			// since the slice has a non-primitive, we have to zero it
+			copy(this.peers[k:], this.peers[k+1:])
+			this.peers[len(this.peers)-1] = nil // zero it
+			this.peers = this.peers[:len(this.peers)-1]
 		}
 	}
 }
@@ -152,11 +158,14 @@ func NewPeer(dirAddr string, bindAddr string, codec gomsg.Codec) *Peer {
 		codec: codec,
 		peers: NewPeers(),
 	}
-	this.local = gomsg.NewServer().SetCodec(codec)
+	this.local = gomsg.NewServer()
+	this.local.SetDefaultTimeout(time.Second)
+	this.local.SetCodec(codec)
 	this.local.Listen(bindAddr)
 
 	this.dir = gomsg.NewClient().SetCodec(codec)
-	this.dir.OnConnect = func(c net.Conn) {
+	this.dir.SetDefaultTimeout(time.Second)
+	this.dir.OnConnect = func(w *gomsg.Wire) {
 		this.dir.Handle("NEW", func(peerAddr string) {
 			if peerAddr != this.self {
 				fmt.Println("====>", bindAddr, ": new peer at", peerAddr)
@@ -199,14 +208,14 @@ func (this *Peer) Push(name string, payload interface{}) error {
 		if err == nil {
 			return nil
 		}
-		fmt.Println("====> peers", cli.Connection().LocalAddr(), err)
+		fmt.Println("====> peers", cli.Conn().LocalAddr(), err)
 	}
-	return gomsg.UNKNOWNTOPIC
+	return errors.New(gomsg.UNKNOWNTOPIC)
 }
 
 func (this *Peer) Request(name string, payload interface{}, handler interface{}) <-chan error {
 	errch := make(chan error, 1)
-	err := gomsg.UNKNOWNTOPIC
+	var err = errors.New(gomsg.UNKNOWNTOPIC)
 
 	// every client knows its remote topics
 	for _, cli := range this.peers.Rotate() {
@@ -221,7 +230,7 @@ func (this *Peer) Request(name string, payload interface{}, handler interface{})
 
 func (this *Peer) RequestAll(name string, payload interface{}, handler interface{}) <-chan error {
 	var wg sync.WaitGroup
-	err := gomsg.UNKNOWNTOPIC
+	var err = errors.New(gomsg.UNKNOWNTOPIC)
 	for _, cli := range this.peers.List() {
 		wg.Add(1)
 		ch := cli.Request(name, payload, handler)

@@ -1,10 +1,13 @@
-package gomsg
+package test
 
 import (
 	"fmt"
 	"strings"
 	"testing"
 	"time"
+
+	. "github.com/quintans/gomsg"
+	"github.com/quintans/toolkit/log"
 )
 
 const (
@@ -28,18 +31,37 @@ func waitASecond() {
 	time.Sleep(time.Second)
 }
 
+func init() {
+	log.Register("/", log.DEBUG).ShowCaller(true)
+}
+
+var logger = log.LoggerFor("/").SetCallerAt(2)
+
 func TestPubSubOneToOne(t *testing.T) {
+	wait() // give time to the previous test to shutdown
+
 	var request string
 	server := NewServer()
+	server.SetLogger(log.Wrap{logger, "{server}"})
 	server.Handle(CONSUMER, func(m string) {
 		fmt.Println("<<< handling client pub:", m)
 		request = m
 	})
-	server.Listen(SERVER_PORT_1)
-	defer server.Destroy()
+	go func() {
+		if err := <-server.Listen(SERVER_PORT_1); err != nil {
+			t.Fatalf("Failed when listening. %+v", err)
+		}
+		fmt.Println("Destroying server")
+	}()
 
-	cli := NewClient().Connect(SERVER_1)
-	defer cli.Destroy()
+	// give time to connect
+	wait()
+
+	cli := NewClient()
+	cli.SetLogger(log.Wrap{logger, "{cli}"})
+	if err := <-cli.Connect(SERVER_1); err != nil {
+		t.Fatalf("Failed when trying to connect. %+v", err)
+	}
 	// give time to connect
 	wait()
 
@@ -70,9 +92,16 @@ func TestPubSubOneToOne(t *testing.T) {
 	if request != MESSAGE {
 		t.Fatalf(FORMAT_ERROR, MESSAGE, request)
 	}
+
+	fmt.Println("Destroying client...")
+	cli.Destroy()
+	fmt.Println("Destroying server...")
+	server.Destroy()
 }
 
 func TestPubSub(t *testing.T) {
+	wait() // give time to the previous test to shutdown
+
 	server := NewServer()
 	server.Listen(SERVER_PORT_1)
 	defer server.Destroy()
@@ -80,25 +109,25 @@ func TestPubSub(t *testing.T) {
 	var received = 0
 	// client #1
 	cli1 := NewClient()
+	defer cli1.Destroy()
 	cli1.Handle(CONSUMER, func(m string) {
 		fmt.Println("<<< client #1: received", m)
 		if m == MESSAGE {
 			received++
 		}
 	})
-	cli1.Connect(SERVER_1)
-	defer cli1.Destroy()
+	<-cli1.Connect(SERVER_1)
 
 	// client #2
 	cli2 := NewClient()
+	defer cli2.Destroy()
 	cli2.Handle(CONSUMER, func(m string) {
 		fmt.Println("<<< client #2: received", m)
 		if m == MESSAGE {
 			received++
 		}
 	})
-	cli2.Connect(SERVER_1)
-	defer cli2.Destroy()
+	<-cli2.Connect(SERVER_1)
 
 	// give time to connect
 	wait()
@@ -117,6 +146,8 @@ func TestPubSub(t *testing.T) {
 }
 
 func TestPubSubHA(t *testing.T) {
+	wait() // give time to the previous test to shutdown
+
 	server := NewServer()
 	server.Listen(SERVER_PORT_1)
 	defer server.Destroy()
@@ -132,8 +163,8 @@ func TestPubSubHA(t *testing.T) {
 	})
 	// make it belong to a group.
 	cli1.SetGroupId("HA")
-	cli1.Connect(SERVER_1)
 	defer cli1.Destroy()
+	<-cli1.Connect(SERVER_1)
 
 	// client #2
 	cli2 := NewClient()
@@ -145,19 +176,19 @@ func TestPubSubHA(t *testing.T) {
 	})
 	// make it belong to a group.
 	cli2.SetGroupId("HA")
-	cli2.Connect(SERVER_1)
 	defer cli2.Destroy()
+	<-cli2.Connect(SERVER_1)
 
 	// client #3
 	cli3 := NewClient()
+	defer cli3.Destroy()
 	cli3.Handle(CONSUMER, func(m string) {
 		fmt.Println("<<< client #3: received", m)
 		if m == MESSAGE {
 			received++
 		}
 	})
-	cli3.Connect(SERVER_1)
-	defer cli3.Destroy()
+	<-cli3.Connect(SERVER_1)
 
 	// give time to connect
 	wait()
@@ -179,6 +210,8 @@ func TestPubSubHA(t *testing.T) {
 }
 
 func TestPushPull(t *testing.T) {
+	wait() // give time to the previous test to shutdown
+
 	server := NewServer()
 	server.Listen(SERVER_PORT_1)
 	defer server.Destroy()
@@ -186,26 +219,26 @@ func TestPushPull(t *testing.T) {
 	// client #1
 	var received1 = 0
 	cli1 := NewClient()
+	defer cli1.Destroy()
 	cli1.Handle(CONSUMER, func(m string) {
 		fmt.Println("<<< client #1: received", m)
 		if m == MESSAGE {
 			received1++
 		}
 	})
-	cli1.Connect(SERVER_1)
-	defer cli1.Destroy()
+	<-cli1.Connect(SERVER_1)
 
 	// client #2
 	var received2 = 0
 	cli2 := NewClient()
+	defer cli2.Destroy()
 	cli2.Handle(CONSUMER, func(m string) {
 		fmt.Println("<<< client #2: received", m)
 		if m == MESSAGE {
 			received2++
 		}
 	})
-	cli2.Connect(SERVER_1)
-	defer cli2.Destroy()
+	<-cli2.Connect(SERVER_1)
 
 	// give time to connect
 	wait()
@@ -235,25 +268,27 @@ func TestPushPull(t *testing.T) {
 }
 
 func TestRequestReply(t *testing.T) {
+	wait() // give time to the previous test to shutdown
+
 	server := NewServer()
 	server.Listen(SERVER_PORT_1)
 	defer server.Destroy()
 
 	cli1 := NewClient()
+	defer cli1.Destroy()
 	cli1.Handle(PRODUCER, func(ctx *Request, m string) (string, error) {
 		fmt.Println("<<< client #1 handling", m, "from", ctx.Connection().RemoteAddr())
 		return strings.ToUpper(m), nil
 	})
-	cli1.Connect(SERVER_1)
-	defer cli1.Destroy()
+	<-cli1.Connect(SERVER_1)
 
 	cli2 := NewClient()
+	defer cli2.Destroy()
 	cli2.Handle(PRODUCER, func(ctx *Request, m string) (string, error) {
 		fmt.Println("<<< client #2 handling", m, "from", ctx.Connection().RemoteAddr())
 		return strings.ToUpper(m), nil
 	})
-	cli2.Connect(SERVER_1)
-	defer cli2.Destroy()
+	<-cli2.Connect(SERVER_1)
 
 	// give time to connect
 	wait()
@@ -276,25 +311,28 @@ func TestRequestReply(t *testing.T) {
 }
 
 func TestRequestAllReply(t *testing.T) {
+	wait() // give time to the previous test to shutdown
+
 	server := NewServer()
 	server.Listen(SERVER_PORT_1)
 	defer server.Destroy()
+	wait()
 
 	cli1 := NewClient()
+	defer cli1.Destroy()
 	cli1.Handle(PRODUCER, func(ctx *Request, m string) (string, error) {
 		fmt.Println("<<< client #1 handling", m, "from", ctx.Connection().RemoteAddr())
 		return strings.ToUpper(m), nil
 	})
-	cli1.Connect(SERVER_1)
-	defer cli1.Destroy()
+	<-cli1.Connect(SERVER_1)
 
 	cli2 := NewClient()
+	defer cli2.Destroy()
 	cli2.Handle(PRODUCER, func(ctx *Request, m string) (string, error) {
 		fmt.Println("<<< client #2 handling", m, "from", ctx.Connection().RemoteAddr())
 		return strings.ToUpper(m), nil
 	})
-	cli2.Connect(SERVER_1)
-	defer cli2.Destroy()
+	<-cli2.Connect(SERVER_1)
 
 	// give time to connect
 	wait()
@@ -310,7 +348,7 @@ func TestRequestAllReply(t *testing.T) {
 		if ctx.Last() {
 			endMarker++
 		}
-	}, time.Second)
+	})
 
 	if err != nil {
 		t.Fatalf("Error: %s", err)
@@ -324,32 +362,36 @@ func TestRequestAllReply(t *testing.T) {
 }
 
 func TestRouteClients(t *testing.T) {
+	wait() // give time to the previous test to shutdown
+
 	server := NewServer()
-	server.Listen(SERVER_PORT_1)
 	defer server.Destroy()
 	// all (*) messages arriving to the server are routed to the clients
-	server.Route("*", time.Second, nil)
+	server.Route("*", time.Second, nil, nil)
+	server.Listen(SERVER_PORT_1)
+	wait()
 
 	cli1 := NewClient()
+	defer cli1.Destroy()
 	cli1.Handle(PRODUCER, func(ctx *Request, m string) (string, error) {
 		fmt.Println("<<< client #1 handling", m, "from", ctx.Connection().RemoteAddr())
 		return strings.ToUpper(m), nil
 	})
-	cli1.Connect(SERVER_1)
-	defer cli1.Destroy()
+	<-cli1.Connect(SERVER_1)
 
 	cli2 := NewClient()
+	defer cli2.Destroy()
 	cli2.Handle(PRODUCER, func(ctx *Request, m string) (string, error) {
 		fmt.Println("<<< client #2 handling", m, "from", ctx.Connection().RemoteAddr())
 		return strings.ToUpper(m), nil
 	})
-	cli2.Connect(SERVER_1)
-	defer cli2.Destroy()
+	<-cli2.Connect(SERVER_1)
 
 	// give time to connect
 	wait()
 
-	cli3 := NewClient().Connect(SERVER_1)
+	cli3 := NewClient()
+	<-cli3.Connect(SERVER_1)
 	var expected = 0
 	var endMarker = 0
 	// using <- makes the call synchronous
@@ -376,11 +418,16 @@ func TestRouteClients(t *testing.T) {
 }
 
 func TestRouteClientsHA(t *testing.T) {
+	wait() // give time to the previous test to shutdown
+
 	server := NewServer()
+	server.LoadBalancer().SetPolicyFactory(func() LBPolicy {
+		return &RoundRobinPolicy{}
+	})
 	defer server.Destroy()
 	server.Listen(SERVER_PORT_1)
 	// all messages arriving to the server are routed to the clients
-	server.Route("*", time.Second, nil)
+	server.Route("*", time.Second, nil, nil)
 
 	ungrouped := 0
 	cli := NewClient()
@@ -391,7 +438,7 @@ func TestRouteClientsHA(t *testing.T) {
 			ungrouped++
 		}
 	})
-	cli.Connect(SERVER_1)
+	<-cli.Connect(SERVER_1)
 
 	group1 := 0
 	// Group HA subscriber
@@ -404,7 +451,7 @@ func TestRouteClientsHA(t *testing.T) {
 			group1++
 		}
 	})
-	cli1.Connect(SERVER_1)
+	<-cli1.Connect(SERVER_1)
 
 	// Group HA subscriber
 	group2 := 0
@@ -417,22 +464,25 @@ func TestRouteClientsHA(t *testing.T) {
 			group2++
 		}
 	})
-	cli2.Connect(SERVER_1)
+	<-cli2.Connect(SERVER_1)
 
 	// publisher
 	cli3 := NewClient()
 	defer cli3.Destroy()
-	cli3.Connect(SERVER_1)
+	<-cli3.Connect(SERVER_1)
 
 	wait()
 
 	// Only one element of the group HA will process each message, alternately (round robin).
 	cli3.Publish(CONSUMER, "one")
-	cli3.Publish(CONSUMER, "two")
-	cli3.Publish(CONSUMER, "three")
-	cli3.Publish(CONSUMER, "four")
-
 	wait()
+	cli3.Publish(CONSUMER, "two")
+	wait()
+	cli3.Publish(CONSUMER, "three")
+	wait()
+	cli3.Publish(CONSUMER, "four")
+	wait()
+
 	if ungrouped != 4 {
 		t.Fatalf(FORMAT_ERROR, 4, ungrouped)
 	}
@@ -445,38 +495,40 @@ func TestRouteClientsHA(t *testing.T) {
 }
 
 func TestRequestAllReplyHA(t *testing.T) {
+	wait() // give time to the previous test to shutdown
+
 	server := NewServer()
 	server.Listen(SERVER_PORT_1)
 	defer server.Destroy()
 
 	// client #1
 	cli1 := NewClient()
+	defer cli1.Destroy()
 	cli1.Handle(PRODUCER, func(ctx *Request, m string) (string, error) {
 		fmt.Println("<<< client #1 handling", m, "from", ctx.Connection().RemoteAddr())
 		return strings.ToUpper(m), nil
 	})
-	cli1.Connect(SERVER_1)
-	defer cli1.Destroy()
+	<-cli1.Connect(SERVER_1)
 
 	// client #2
 	cli2 := NewClient()
+	defer cli2.Destroy()
 	cli2.Handle(PRODUCER, func(ctx *Request, m string) (string, error) {
 		fmt.Println("<<< client #2 handling", m, "from", ctx.Connection().RemoteAddr())
 		return strings.ToUpper(m), nil
 	})
 	cli2.SetGroupId("HA")
-	cli2.Connect(SERVER_1)
-	defer cli2.Destroy()
+	<-cli2.Connect(SERVER_1)
 
 	// client #3
 	cli3 := NewClient()
+	defer cli3.Destroy()
 	cli3.Handle(PRODUCER, func(ctx *Request, m string) (string, error) {
 		fmt.Println("<<< client #3 handling", m, "from", ctx.Connection().RemoteAddr())
 		return strings.ToUpper(m), nil
 	})
 	cli3.SetGroupId("HA")
-	cli3.Connect(SERVER_1)
-	defer cli3.Destroy()
+	<-cli3.Connect(SERVER_1)
 
 	// give time to connect
 	wait()
@@ -488,7 +540,7 @@ func TestRequestAllReplyHA(t *testing.T) {
 		if r == "HELLO" {
 			expected++
 		}
-	}, time.Second)
+	})
 
 	if err != nil {
 		t.Fatalf("Error: %s", err)
@@ -499,12 +551,15 @@ func TestRequestAllReplyHA(t *testing.T) {
 }
 
 func TestLateSubscription(t *testing.T) {
+	wait() // give time to the previous test to shutdown
+
 	server := NewServer()
 	server.Listen(SERVER_PORT_1)
 	defer server.Destroy()
 
-	cli := NewClient().Connect(SERVER_1)
+	cli := NewClient()
 	defer cli.Destroy()
+	<-cli.Connect(SERVER_1)
 
 	// time to connect
 	wait()
@@ -549,8 +604,11 @@ func TestLateSubscription(t *testing.T) {
 }
 
 func TestLateServer(t *testing.T) {
-	cli := NewClient().Connect(SERVER_1)
+	wait() // give time to the previous test to shutdown
+
+	cli := NewClient()
 	defer cli.Destroy()
+	cli.Connect(SERVER_1)
 	wait()
 
 	// THE SERVER SHOWS UP AFTER THE CLIENT
@@ -578,11 +636,14 @@ func TestLateServer(t *testing.T) {
 }
 
 func TestMultiReply(t *testing.T) {
+	wait() // give time to the previous test to shutdown
+
 	// all messages arriving to the server are routed to the clients
 	server := NewServer()
 	defer server.Destroy()
+	server.Route("*", time.Second, nil, nil)
 	server.Listen(SERVER_PORT_1)
-	server.Route("*", time.Second, nil)
+	wait()
 
 	cli := NewClient()
 	defer cli.Destroy()
@@ -593,10 +654,11 @@ func TestMultiReply(t *testing.T) {
 		ctx.SendReply([]byte("\"Pipe #2\""))
 		ctx.Terminate()
 	})
-	cli.Connect(SERVER_1)
+	<-cli.Connect(SERVER_1)
 
-	cli3 := NewClient().Connect(SERVER_1)
+	cli3 := NewClient()
 	defer cli3.Destroy()
+	<-cli3.Connect(SERVER_1)
 
 	wait()
 
@@ -624,11 +686,13 @@ func TestMultiReply(t *testing.T) {
 }
 
 func TestMultiReplyMix(t *testing.T) {
+	wait() // give time to the previous test to shutdown
+
 	// all messages arriving to the server are routed to the clients
 	server := NewServer()
 	defer server.Destroy()
 	server.Listen(SERVER_PORT_1)
-	server.Route("*", time.Second, nil)
+	server.Route("*", time.Second, nil, nil)
 
 	cli := NewClient()
 	defer cli.Destroy()
@@ -639,16 +703,18 @@ func TestMultiReplyMix(t *testing.T) {
 		ctx.SendReply([]byte("\"Pipe #2\""))
 		ctx.Terminate()
 	})
-	cli.Connect(SERVER_1)
+	<-cli.Connect(SERVER_1)
 
 	cli2 := NewClient()
+	defer cli2.Destroy()
 	cli2.Handle(PRODUCER, func(ctx *Request) string {
 		return "Pipe #201"
 	})
-	cli2.Connect(SERVER_1)
+	<-cli2.Connect(SERVER_1)
 
-	cli3 := NewClient().Connect(SERVER_1)
+	cli3 := NewClient()
 	defer cli3.Destroy()
+	<-cli3.Connect(SERVER_1)
 
 	wait()
 
@@ -666,9 +732,12 @@ func TestMultiReplyMix(t *testing.T) {
 	if received != 3 {
 		t.Fatalf(FORMAT_ERROR, 3, received)
 	}
+
 }
 
 func TestRouteServers(t *testing.T) {
+	wait() // give time to the previous test to shutdown
+
 	// routing requests between server 1 and server 2
 	server1 := NewServer()
 	server1.Listen(SERVER_PORT_1)
@@ -677,23 +746,24 @@ func TestRouteServers(t *testing.T) {
 	server2.Listen(SERVER_PORT_2)
 	defer server2.Destroy()
 	// all (*) messages arriving to server 1 are routed to server 2
-	Route("*", server1, server2, time.Second, nil)
+	Route("*", server1, server2, time.Second, nil, nil)
 
 	// client 1 connects to server 1
-	cli := NewClient().Connect(SERVER_1)
+	cli := NewClient()
 	defer cli.Destroy()
+	<-cli.Connect(SERVER_1)
 	cli2 := NewClient()
+	defer cli2.Destroy()
 	var received = 0
 	cli2.Handle(PRODUCER, func(ctx *Request, m string) (string, error) {
 		fmt.Println("<<< processing:", m, "from", ctx.Connection().RemoteAddr())
 		return strings.ToUpper(m), nil
 	})
 	// client 2 connects to server 2
-	cli2.Connect(SERVER_2)
-	defer cli2.Destroy()
+	<-cli2.Connect(SERVER_2)
 
 	err := <-cli.Request(PRODUCER, MESSAGE, func(ctx Response, r string, e error) {
-		fmt.Println(">>> reply:", r, e, "from", ctx.Connection().RemoteAddr())
+		fmt.Println(">>> reply:", r, "; error:", e, "from", ctx.Connection().RemoteAddr())
 		if r == strings.ToUpper(MESSAGE) {
 			received++
 		}

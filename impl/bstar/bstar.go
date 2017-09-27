@@ -1,8 +1,9 @@
-package impl
+// THIS IS A WORK IN PROGRESS
+
+package bstar
 
 import (
 	"fmt"
-	"strings"
 	"sync"
 	"time"
 
@@ -11,19 +12,21 @@ import (
 
 // heavely inspiried in http://zguide.zeromq.org/java:bstar
 
-const PUB_PREFIX = "pub/"
+//  State we can have at any point in time
+type State uint8
 
-//  States we can be in at any point in time
 const (
-	STATE_PRIMARY uint8 = iota + 1 //  Primary, waiting for peer to connect
+	STATE_PRIMARY State = iota + 1 //  Primary, waiting for peer to connect
 	STATE_BACKUP                   //  Backup, waiting for peer to connect
 	STATE_ACTIVE                   //  Active - accepting connections
 	STATE_PASSIVE                  //  Passive - not accepting connections
 )
 
 //  Events, which start with the states our peer can be in
+type Event uint8
+
 const (
-	PEER_PRIMARY   uint8 = iota + 1 //  HA peer is pending primary
+	PEER_PRIMARY   Event = iota + 1 //  HA peer is pending primary
 	PEER_BACKUP                     //  HA peer is pending backup
 	PEER_ACTIVE                     //  HA peer is active
 	PEER_PASSIVE                    //  HA peer is passive
@@ -33,14 +36,15 @@ const (
 var codec = gomsg.JsonCodec{}
 
 type BStar struct {
-	mu         sync.RWMutex
-	quit       chan bool
-	state      uint8 //  Current state
-	event      uint8 //  Current event
-	statepub   *gomsg.Client
-	statesub   *gomsg.Server
-	frontend   *gomsg.Server
-	peerExpiry time.Time //  When peer is considered 'dead'
+	mu              sync.RWMutex
+	quit            chan bool
+	state           State //  Current state
+	event           Event //  Current event
+	statepub        *gomsg.Client
+	statesub        *gomsg.Server
+	frontend        *gomsg.Server
+	peerExpiry      time.Time //  When peer is considered 'dead'
+	frontendHandler func(bstar *BStar, ctx *gomsg.Request)
 
 	stateRemoteAddr string
 	stateLocalAddr  string
@@ -55,7 +59,7 @@ const HEARTBEAT = time.Second
 //  The FSM runs one event at a time. We apply an event to the current state,
 //  which checks if the event is accepted, and if so, sets a new state:
 
-func (this *BStar) stateMachine(event uint8) bool {
+func (this *BStar) stateMachine(event Event) bool {
 	this.mu.Lock()
 	defer this.mu.Unlock()
 
@@ -64,47 +68,58 @@ func (this *BStar) stateMachine(event uint8) bool {
 
 	//  These are the PRIMARY and BACKUP states; we're waiting to become
 	//  ACTIVE or PASSIVE depending on events we get from our peer:
-	if this.state == STATE_PRIMARY {
-		if this.event == PEER_BACKUP {
+	switch this.state {
+	case STATE_PRIMARY:
+		switch this.event {
+		case PEER_BACKUP:
 			fmt.Println("I: connected to backup (passive), ready active")
 			this.state = STATE_ACTIVE
-		} else if this.event == PEER_ACTIVE {
+
+		case PEER_ACTIVE:
 			fmt.Println("I: connected to backup (active), ready passive")
 			this.state = STATE_PASSIVE
 		}
-	} else if this.state == STATE_BACKUP {
+
+	case STATE_BACKUP:
 		//  Accept client connections
-		if this.event == PEER_ACTIVE {
+		switch this.event {
+		case PEER_ACTIVE:
 			fmt.Println("I: connected to primary (active), ready passive")
 			this.state = STATE_PASSIVE
-		} else if this.event == CLIENT_REQUEST {
+		case CLIENT_REQUEST:
 			//  Reject client connections when acting as backup
 			exception = true
 		}
-	} else if this.state == STATE_ACTIVE {
+
+	case STATE_ACTIVE:
 		//  These are the ACTIVE and PASSIVE states:
 		if this.event == PEER_ACTIVE {
 			//  Two actives would mean split-brain
 			fmt.Println("E: fatal error - dual actives, aborting")
 			exception = true
 		}
-	} else if this.state == STATE_PASSIVE {
+
+	case STATE_PASSIVE:
 		//  Server is passive
 		//  CLIENT_REQUEST events can trigger failover if peer looks dead
 
-		if this.event == PEER_PRIMARY {
+		switch this.event {
+		case PEER_PRIMARY:
 			//  Peer is restarting - become active, peer will go passive
 			fmt.Println("I: primary (passive) is restarting, ready active")
 			this.state = STATE_ACTIVE
-		} else if this.event == PEER_BACKUP {
+
+		case PEER_BACKUP:
 			//  Peer is restarting - become active, peer will go passive
 			fmt.Println("I: backup (passive) is restarting, ready active")
 			this.state = STATE_ACTIVE
-		} else if this.event == PEER_PASSIVE {
+
+		case PEER_PASSIVE:
 			//  Two passives would mean cluster would be non-responsive
 			fmt.Println("E: fatal error - dual passives, aborting")
 			exception = true
-		} else if this.event == CLIENT_REQUEST {
+
+		case CLIENT_REQUEST:
 			//  Peer becomes active if timeout has passed
 			//  It's the client request that triggers the failover
 			if time.Now().After(this.peerExpiry) {
@@ -130,7 +145,7 @@ func NewBStar(primary bool, frontentAddr string, stateLocalAddr string, stateRem
 		fmt.Println("I: Primary active, waiting for backup (passive)")
 		this.state = STATE_PRIMARY
 	} else {
-		fmt.Println("I: Backup passive, waiting for primary (active)\n")
+		fmt.Println("I: Backup passive, waiting for primary (active)")
 		this.state = STATE_BACKUP
 	}
 
@@ -138,11 +153,12 @@ func NewBStar(primary bool, frontentAddr string, stateLocalAddr string, stateRem
 
 	this.statepub = gomsg.NewClient().SetCodec(codec)
 
-	this.statesub = gomsg.NewServer().SetCodec(codec)
+	this.statesub = gomsg.NewServer()
+	this.statesub.SetCodec(codec)
 	this.statesub.Handle("STATE", func(ctx *gomsg.Request) {
 		state, _ := ctx.Reader().ReadUI8()
 		//  Have state from our peer, execute as event
-		if this.stateMachine(state) {
+		if this.stateMachine(Event(state)) {
 			this.quit <- true //  Error, so exit
 		} else {
 			this.updatePeerExpiry()
@@ -150,24 +166,17 @@ func NewBStar(primary bool, frontentAddr string, stateLocalAddr string, stateRem
 
 	})
 
-	this.frontend = gomsg.NewServer().SetCodec(codec)
-	this.frontend.Route("*", time.Second, func(ctx *gomsg.Request) bool {
+	this.frontend = gomsg.NewServer()
+	this.frontend.SetCodec(codec)
+	this.frontend.Handle("*", func(ctx *gomsg.Request) {
 		//  Have a client request
 		ok := !this.stateMachine(CLIENT_REQUEST)
-		// Consider any request under "pub/" to be a publish.
-		// This is way we can publishing and receive a confirmation.
-		// To allow for the other clients receive the a PUB message under the right topic
-		// the kind and name are fixed.
-		if strings.HasPrefix(ctx.Name, PUB_PREFIX) {
-			ctx.Kind = gomsg.PUB
-			ctx.Name = ctx.Name[len(PUB_PREFIX):]
-			if ok {
-				// sends ACK to caller
-				ctx.Terminate()
-			}
+		if ok {
+			this.frontendHandler(this, ctx)
+		} else {
+			// rejects request
+			ctx.Terminate()
 		}
-
-		return ok
 	})
 
 	this.stateRemoteAddr = stateRemoteAddr
@@ -175,6 +184,11 @@ func NewBStar(primary bool, frontentAddr string, stateLocalAddr string, stateRem
 	this.frontentAddr = frontentAddr
 
 	return this
+}
+
+// SetClientHandler defines the function that will handle the clients requests
+func (bstar *BStar) SetClientHandler(handler func(bstart *BStar, ctx *gomsg.Request)) {
+	bstar.frontendHandler = handler
 }
 
 func (this *BStar) updatePeerExpiry() {
@@ -193,11 +207,11 @@ func (this *BStar) Start() {
 	for {
 		select {
 		case <-this.quit:
-			break //  Context has been shut down
+			return //  Context has been shut down
 		case <-time.After(HEARTBEAT):
 			//  If we timed out, send state to peer
 			msg := gomsg.NewMsg()
-			msg.WriteUI8(this.state)
+			msg.WriteUI8(uint8(this.state))
 			this.statepub.Publish("STATE", msg)
 		}
 	}
@@ -207,61 +221,6 @@ func (this *BStar) Start() {
 	this.frontend.Destroy()
 }
 
-func (this *BStar) Stop() {
-	this.quit <- true
-}
-
-const (
-	REQUEST_TIMEOUT = time.Second
-	SETTLE_DELAY    = REQUEST_TIMEOUT * 2 //  Before failing over
-)
-
-type BStarClient struct {
-	client    *gomsg.Client
-	servers   []string
-	serverNbr int
-}
-
-func NewBStarClient(primary string, backup string) BStarClient {
-	this := BStarClient{
-		client:  gomsg.NewClient().SetCodec(codec),
-		servers: []string{primary, backup},
-	}
-	this.client.SetTimeout(time.Second)
-	this.client.Connect(primary)
-
-	return this
-}
-
-func (this BStarClient) PublishTimeout(name string, payload interface{}, timeout time.Duration) {
-	// If there's no reply within our timeout, we close the socket and try again.
-	//  In Binary Star, it's the client vote that decides which
-	//  server is primary; the client must therefore try to connect
-	//  to each server in turn:
-	endpoint := fmt.Sprintf("%s/%s", PUB_PREFIX, name)
-	expectReply := true
-	handler := func() {
-		fmt.Println("I: server replied OK")
-	}
-	// A request is used so that the bstar server can decide not to reply
-	// if there is an inconsistent server state
-	ch := this.client.RequestTimeout(endpoint, payload, handler, timeout)
-	for expectReply {
-		err := <-ch
-		if err == nil {
-			expectReply = false
-		} else {
-			fmt.Println("W: no response from server, failing over. error:", err)
-			//  client is confused; close it and open a new one
-			this.client.Destroy()
-			this.serverNbr = (this.serverNbr + 1) % 2
-			<-time.After(SETTLE_DELAY)
-			fmt.Printf("I: connecting to server at %s...\n", this.servers[this.serverNbr])
-			this.client = gomsg.NewClient().SetCodec(codec)
-			this.client.Connect(this.servers[this.serverNbr])
-
-			//  Send request again, on new client
-			ch = this.client.RequestTimeout(endpoint, payload, handler, timeout)
-		}
-	}
+func (bstar *BStar) Stop() {
+	bstar.quit <- true
 }
